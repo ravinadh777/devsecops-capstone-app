@@ -1,0 +1,9 @@
+node_modules/
+coverage/
+.env
+*.log
+zap-report.*
+trivy-*.json
+trivy-*.sarif
+sbom.cdx.json
+.scannerwork/

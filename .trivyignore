@@ -1,0 +1,5 @@
+# Accepted risks. Every entry MUST have: CVE id, reason, owner and review date.
+# Never add an entry just to make the pipeline green.
+#
+# Example:
+# CVE-2099-00000  # not reachable: affects feature X we do not use | owner: tutor | review: 2026-12-01

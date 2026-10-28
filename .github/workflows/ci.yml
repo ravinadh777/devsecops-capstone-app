@@ -1,0 +1,257 @@
+name: CI - test, scan, build, publish, deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege by default; jobs widen only what they need.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_NAME: student-task-manager
+  NODE_VERSION: '22'
+  TRIVY_VERSION: '0.76.1'
+
+# Third-party actions are pinned to full commit SHAs (tags can be moved by attackers).
+jobs:
+  # ---------------------------------------------------------------- 1. Build & test
+  lint-test:
+    name: Lint and unit/integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: tasks
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: tasks
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U tasks" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - name: Tests with coverage (incl. PostgreSQL integration)
+        run: npm run test:coverage
+        env:
+          TEST_PG: '1'
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: tasks
+          PGPASSWORD: ci-only-password
+          PGDATABASE: tasks
+      - name: Dependency audit (production deps)
+        run: npm audit --omit=dev --audit-level=high
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage
+          path: coverage/lcov.info
+          retention-days: 7
+
+  # ---------------------------------------------------------------- 2. SAST
+  sast-sonarqube:
+    name: SonarQube SAST and quality gate
+    needs: lint-test
+    # Pull requests from forks get no secrets on public repos, so SAST runs for
+    # same-repo PRs and every push to main (the release path is always scanned).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Default: GitHub-hosted runner + SonarQube Cloud (free for public repos).
+    # Private repos with SonarQube on EC2: set SONAR_RUNS_ON to ["self-hosted","capstone-ec2"].
+    runs-on: ${{ fromJSON(vars.SONAR_RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0   # full history improves new-code detection
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: coverage
+          path: coverage
+      - name: Check SonarQube configuration
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          if [[ -z "${SONAR_TOKEN}" || -z "${SONAR_HOST_URL}" ]]; then
+            echo "::error::SONAR_TOKEN and SONAR_HOST_URL secrets are required (see docs/RUNBOOK.md, Lab 2)."
+            exit 1
+          fi
+      - name: SonarQube scan (fails if the quality gate fails)
+        uses: SonarSource/sonarqube-scan-action@2f77a1ec69fb1d595b06f35ab27e97605bdef703 # v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY || 'ravinadh777_devsecops-capstone-app' }}
+            ${{ vars.SONAR_ORGANIZATION && format('-Dsonar.organization={0}', vars.SONAR_ORGANIZATION) || '' }}
+
+  # ---------------------------------------------------------------- 3. Repo scan
+  trivy-repo:
+    name: Trivy repo scan (deps, secrets, Dockerfile misconfig)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned, checksum-verified Trivy
+        run: .github/scripts/install-trivy.sh
+      - name: Scan repository
+        run: |
+          trivy fs . --scanners vuln,secret,misconfig \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            --ignorefile .trivyignore --format table
+      - name: Report (JSON artifact)
+        if: always()
+        run: trivy fs . --scanners vuln,secret,misconfig --format json --output trivy-repo.json --exit-code 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: trivy-repo-report
+          path: trivy-repo.json
+          retention-days: 14
+
+  # ---------------------------------------------------------------- 4. Image
+  build-scan-push:
+    name: Build, scan and publish image
+    needs: [lint-test, sast-sonarqube, trivy-repo]
+    # Runs when SAST passed, or was skipped for a fork PR (fork PRs never publish).
+    if: >-
+      always() && needs.lint-test.result == 'success' && needs.trivy-repo.result == 'success' &&
+      (needs.sast-sonarqube.result == 'success' ||
+       (needs.sast-sonarqube.result == 'skipped' && github.event_name == 'pull_request'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Compute image reference
+        id: meta
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          owner="${DOCKERHUB_USERNAME:-local}"
+          tag="${GITHUB_SHA::7}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "image=${owner}/${IMAGE_NAME}:${tag}" >> "$GITHUB_OUTPUT"
+      - name: Build image
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          docker build --pull \
+            --build-arg GIT_SHA="${GITHUB_SHA}" \
+            --build-arg APP_VERSION="$(node -p "require('./package.json').version")" \
+            -t "${IMAGE}" .
+      - name: Container smoke test
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          docker run -d --name smoke -p 3000:3000 --read-only --tmpfs /tmp --cap-drop ALL "${IMAGE}"
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/health && break; sleep 1; done
+          curl -fsS http://127.0.0.1:3000/ready
+          test "$(curl -fsS http://127.0.0.1:3000/version | jq -r .gitSha)" = "${GITHUB_SHA}"
+          test "$(docker exec smoke id -u)" != "0"   # must not run as root
+          docker rm -f smoke
+      - name: Install pinned, checksum-verified Trivy
+        run: .github/scripts/install-trivy.sh
+      - name: Trivy image scan (gate - CRITICAL fixable vulnerabilities block release)
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          trivy image "${IMAGE}" --scanners vuln,secret --severity CRITICAL \
+            --ignore-unfixed --ignorefile .trivyignore --exit-code 1 --format table
+      - name: Full image report and SBOM (always)
+        if: always()
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          trivy image "${IMAGE}" --format json --output trivy-image.json --exit-code 0 || true
+          trivy image "${IMAGE}" --format cyclonedx --output sbom.cdx.json --exit-code 0 || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: image-security-reports
+          path: |
+            trivy-image.json
+            sbom.cdx.json
+          retention-days: 30
+      - name: Docker Hub login
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push image (main branch only)
+        id: push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          docker push "${IMAGE}"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}" | cut -d@ -f2)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Published image"
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Digest: \`${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- 5. GitOps
+  update-gitops:
+    name: Promote image tag to GitOps repo
+    needs: build-scan-push
+    if: needs.build-scan-push.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.GITOPS_REPOSITORY != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: gitops-promotion
+      cancel-in-progress: false
+    steps:
+      - name: Update image tag with yq and push
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
+          GITOPS_BRANCH: ${{ vars.GITOPS_BRANCH || 'main' }}
+          VALUES_PATH: ${{ vars.GITOPS_VALUES_PATH || 'charts/student-task-manager/values-demo.yaml' }}
+          IMAGE_REPOSITORY: ${{ secrets.DOCKERHUB_USERNAME }}/student-task-manager
+          IMAGE_TAG: ${{ needs.build-scan-push.outputs.tag }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${GITOPS_BRANCH}" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITOPS_REPOSITORY}.git" gitops
+          cd gitops
+          # yq edits the exact YAML keys (safer than sed, which can hit other "tag:" lines).
+          yq -i ".image.repository = strenv(IMAGE_REPOSITORY) | .image.tag = strenv(IMAGE_TAG)" "${VALUES_PATH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${VALUES_PATH}"
+          if git diff --cached --quiet; then echo "Tag already ${IMAGE_TAG}; nothing to do"; exit 0; fi
+          git commit -m "deploy: student-task-manager ${IMAGE_TAG}" -m "Source: ${SOURCE_URL}"
+          for attempt in 1 2 3; do
+            git push origin "HEAD:${GITOPS_BRANCH}" && exit 0
+            echo "Push rejected (attempt ${attempt}); rebasing"
+            git pull --rebase origin "${GITOPS_BRANCH}"
+          done
+          exit 1

@@ -1,0 +1,90 @@
+name: DAST - OWASP ZAP baseline
+
+# Default mode (no target_url): build the app, run it INSIDE the CI runner and
+# scan http://localhost:3000. Nothing is exposed to the internet, so this is safe
+# for public repositories and runs weekly.
+# Target mode: scan YOUR deployed demo (allow-listed hosts only), typically from a
+# self-hosted runner on the EC2 host of a PRIVATE repo.
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: Leave empty to scan an ephemeral container; or URL of YOUR deployed demo
+        required: false
+        type: string
+        default: ''
+      fail_on_warn:
+        description: Fail the run when ZAP reports WARN-level findings
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC, ephemeral mode
+
+permissions:
+  contents: read
+
+jobs:
+  zap-baseline:
+    runs-on: ${{ fromJSON((inputs.target_url != '' && vars.DAST_RUNS_ON) || '"ubuntu-latest"') }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Start ephemeral app container
+        if: inputs.target_url == ''
+        run: |
+          docker build -t stm:dast .
+          docker run -d --name stm -p 3000:3000 --read-only --tmpfs /tmp stm:dast
+          for _ in $(seq 1 30); do curl -fsS http://localhost:3000/health && break; sleep 1; done
+
+      - name: Resolve and validate target
+        id: target
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+          ALLOWED_HOSTS: ${{ vars.DAST_ALLOWED_HOSTS || 'localhost 127.0.0.1' }}
+        run: |
+          url="${TARGET_URL:-http://localhost:3000}"
+          case "${url}" in
+            http://*|https://*) ;;
+            *) echo "::error::Target must be an http(s) URL"; exit 1 ;;
+          esac
+          host="$(echo "${url}" | sed -E 's#^https?://([^/:]+).*#\1#')"
+          for allowed in ${ALLOWED_HOSTS}; do
+            if [[ "${host}" == "${allowed}" ]]; then
+              echo "url=${url}" >> "$GITHUB_OUTPUT"; echo "Scanning ${url}"; exit 0
+            fi
+          done
+          echo "::error::Host '${host}' is not in DAST_ALLOWED_HOSTS. Only scan systems you own."
+          exit 1
+
+      - name: Run ZAP baseline scan
+        env:
+          TARGET_URL: ${{ steps.target.outputs.url }}
+          ZAP_IMAGE: ${{ vars.ZAP_IMAGE || 'ghcr.io/zaproxy/zaproxy:stable' }}
+          FAIL_ON_WARN: ${{ inputs.fail_on_warn }}
+        run: |
+          mkdir -p zap-out && cp .zap/rules.tsv zap-out/ && chmod 777 zap-out
+          extra="-I"   # -I: do not fail on warnings
+          if [[ "${FAIL_ON_WARN}" == "true" ]]; then extra=""; fi
+          # shellcheck disable=SC2086
+          docker run --rm --network host -v "${PWD}/zap-out:/zap/wrk:rw" "${ZAP_IMAGE}" \
+            zap-baseline.py -t "${TARGET_URL}" -c rules.tsv \
+            -r zap-report.html -J zap-report.json -w zap-report.md ${extra}
+
+      - name: Add findings to the job summary
+        if: always()
+        run: |
+          if [[ -f zap-out/zap-report.md ]]; then cat zap-out/zap-report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Stop ephemeral app container
+        if: always() && inputs.target_url == ''
+        run: docker rm -f stm || true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: zap-report
+          path: zap-out/zap-report.*
+          retention-days: 30

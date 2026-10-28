@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Student Task Manager</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="sheet">
+    <header class="masthead">
+      <div>
+        <h1>Student Task Manager</h1>
+        <p class="lede">Capstone lab board. Every deploy changes the stamp on the right.</p>
+      </div>
+      <aside class="stamp" aria-live="polite" aria-label="Running release">
+        <span class="stamp-label">Release</span>
+        <strong id="release-sha">…</strong>
+        <span id="release-meta">checking</span>
+      </aside>
+    </header>
+
+    <form id="task-form" class="composer" novalidate>
+      <label for="task-title">New task</label>
+      <div class="composer-row">
+        <input id="task-title" name="title" maxlength="120" autocomplete="off"
+               placeholder="Run the Trivy scan and read the report" required>
+        <button type="submit">Add task</button>
+      </div>
+      <p id="form-message" class="message" role="status"></p>
+    </form>
+
+    <section aria-labelledby="list-heading">
+      <h2 id="list-heading">Tasks <span id="task-count" class="count"></span></h2>
+      <ul id="task-list" class="tasks"></ul>
+      <p id="empty" class="empty" hidden>No tasks yet. Add the first one above.</p>
+    </section>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

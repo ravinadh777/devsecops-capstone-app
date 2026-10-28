@@ -1,0 +1,6 @@
+# ZAP baseline rule configuration: <rule id>	<IGNORE|WARN|FAIL>	<reason>
+# Raise rules to FAIL as the team fixes them, so regressions block the run.
+10021	FAIL	X-Content-Type-Options header missing (app sets it on every response)
+10020	FAIL	Anti-clickjacking header (app sends X-Frame-Options DENY and frame-ancestors)
+10038	FAIL	Content Security Policy header not set (app sends a strict CSP)
+10049	IGNORE	Storable/cacheable content: static assets are intentionally cacheable for 5 minutes

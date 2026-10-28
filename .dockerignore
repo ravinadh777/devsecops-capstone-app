@@ -1,0 +1,15 @@
+.git
+.github
+.zap
+node_modules
+coverage
+tests
+load-tests
+*.md
+.env*
+npm-debug.log
+Dockerfile
+.dockerignore
+sonar-project.properties
+eslint.config.js
+.trivyignore
