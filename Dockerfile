@@ -4,13 +4,13 @@
 # Dependabot (.github/dependabot.yml) will then raise PRs when it changes.
 
 # ---- Stage 1: install production dependencies only -------------------------
-FROM node:22-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 # ---- Stage 2: minimal runtime ----------------------------------------------
-FROM node:22-alpine AS runtime
+FROM node:26-alpine AS runtime
 ARG GIT_SHA=local
 ARG APP_VERSION=1.0.0
 LABEL org.opencontainers.image.title="student-task-manager" \
